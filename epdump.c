@@ -7,6 +7,8 @@
  * interface/object UUID pair to a local dynamic endpoint. This trivial tool
  * can be used to identify services that have registered with DCE/RPC endpoint
  * mapper. Usage: epmap [-p port] hostname.
+ *
+ * Endpoint Mapper interface: e1af8308-5d1f-11c9-91a4-08002b14a0fa 
  * 
  * WIP, I have to fix several things.
  *
@@ -391,28 +393,33 @@ typedef struct epmap {
    uint32_t assoc_group;       /* This is usually ignored. */
    ept_lookup_handle_t handle;
    int state;
-   uint32_t status;            /* Code returned by FAULT and BINK NAK, if any. */
+   
+   p_reject_reason_t reason;   /* Rejection reason code in the bind_nak PDU. */
+   uint32_t status;            /* Run-time fault code or zero (fault PDU). */
+   int      wsacode;           /* wsa code */
 } epmap_t;
 
 /* Error and status codes. $fixme */
 
-#define EPMAP_EOK       0x000
-#define EPMAP_ENOMEM    0x1ff
-#define EPMAP_EINVAL    0x200 /* Invalid parameter passed to function? */
-#define EPMAP_EOVERFLOW 0x203 /* Attempt to read or write beyond end of buffer. Nope */
+#define EPMAP_EOK       0x000 /* Operation completed successfully. */
+#define EPMAP_ENOMEM    0x200 /* A call to malloc() failed. */
+#define EPMAP_EINVAL    0x201 /* An invalid argument was passed to a library function. */
+#define EPMAP_EBADPTR   0x202 /* An invalid pointer was detected. */
+#define EPMAP_EWSAINIT  0x203 /* WSAStartup() initialization failed. */
+#define EPMAP_EDNSFAIL  0x204 /* Could not resolve host name. */
+#define EPMAP_ESOCKET   0x205 /* Could not create socket or connect to server. */
+#define EPMAP_ESEND     0x206 /* A call to send() failed. */
+#define EPMAP_ERECV     0x207 /* A call to recv() failed. */
 
-#define EPMAP_EWSAAPI   0x201 /* WSAStartup failed. */
-#define EPMAP_EWSAINIT  0x206 /* WSAStartup() failed. */
-#define EPMAP_ESOCKET   0x202 /* Could not create socket. */
-#define EPMAP_EDNSFAIL  0x203 /* getaddrinfo() failed. */
-#define EPMAP_EACK      0x209  /* */
-#define EPMAP_ENAK      0x210  /* */
-#define EPMAP_EPROTO    0x211  /* Generic protocol error. */
-#define EPMAP_ENOENT    0x300
-#define EPMAP_ECONNECT  0x212
-#define EPMAP_EFAULT    0x213
-#define EPMAP_EDEBUG    0x300
-#define WSAAPI_ERROR    0x80000000 /* Bitmask to set Winsock errors. */
+#define EPMAP_EACK      0x300 /* BIND-ACK PDU */
+#define EPMAP_ENAK      0x301 /* BIND-NAK PDU */
+#define EPMAP_EFAULT    0x302 /* Received a FAULT PDU. */
+#define EPMAP_EPROTO    0x303 /* Generic protocol error. */
+#define EPMAP_ENODATA   0x304 /* Status returned by response $fixme */
+                              
+#define EPMAP_EDEBUG    0x400
+
+
 
 #define EPMAPAPI extern
 
@@ -464,7 +471,9 @@ EPMAPAPI epmap_t *epmap_init(size_t snd_len, size_t rcv_len)
        epmap->handle.uuid.node[i] = 0;
 
    epmap->state = 0;
+   epmap->reason = 0;
    epmap->status = 0;
+   epmap->wsacode = 0;
 
    for (i = 0; i < 2; i++) {
        buffer = &epmap->buffer[i]; 
@@ -505,7 +514,7 @@ static int winsock_init(void)
    return error;   
 }
 
-static SOCKET create_socket(const char *server, uint16_t port, struct sockaddr_in *sin)
+static SOCKET create_socket(const char *server, uint16_t port, struct sockaddr_in *sin, int *ecode)
 {
    SOCKET SocketID = INVALID_SOCKET;
    struct addrinfo *result = NULL;
@@ -522,19 +531,26 @@ static SOCKET create_socket(const char *server, uint16_t port, struct sockaddr_i
    _snprintf(szport, 5, "%u", port); 
    szport[5] = '\0'; /* Redundant. */
 
+   *ecode = 0;
+
    error = getaddrinfo(server, szport, &hints, &result);
-   if (error != 0)
+   if (error != 0) {
+       *ecode = WSAGetLastError();
        return INVALID_SOCKET;
+   }
 
    for (ptr = result; ptr != NULL; ptr = ptr->ai_next) {
        SocketID = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
        if (SocketID == INVALID_SOCKET) {
+           *ecode = WSAGetLastError();
            freeaddrinfo(result);
            WSACleanup(); 
            return INVALID_SOCKET;
        } 
        error = connect(SocketID, ptr->ai_addr, (int)ptr->ai_addrlen);
        if (error == SOCKET_ERROR) {
+           /* Get WSA error here before closesocket resets it. */ 
+           *ecode = WSAGetLastError();
            closesocket(SocketID);
            SocketID = INVALID_SOCKET;
            continue;  
@@ -544,10 +560,9 @@ static SOCKET create_socket(const char *server, uint16_t port, struct sockaddr_i
 
    freeaddrinfo(result);
 
-   if (SocketID == INVALID_SOCKET) {
-       WSACleanup(); 
+   if (SocketID == INVALID_SOCKET) 
        return INVALID_SOCKET;
-   } else {
+   else {
        int sinlen = sizeof(struct sockaddr_in);  
        getpeername(SocketID, sin, &sinlen);     
    }
@@ -573,9 +588,13 @@ static int epmap_connect(epmap_t *epmap, const char *server, uint16_t port)
        return EPMAP_EWSAINIT; 
    }    
 
-   epmap->sockfd = create_socket(epmap->server, epmap->port, &epmap->sin);
-   if (epmap->sockfd == INVALID_SOCKET)
-       return EPMAP_ESOCKET;
+   int ecode;
+
+   epmap->sockfd = create_socket(epmap->server, epmap->port, &epmap->sin, &ecode);
+   if (epmap->sockfd == INVALID_SOCKET) {
+   
+       return ((ecode << 12) | EPMAP_ESOCKET);
+   }
 
    return EPMAP_EOK;
 }
@@ -592,7 +611,7 @@ static int epmap_send(epmap_t *epmap)
    while (length > 0 && n != SOCKET_ERROR) {
        n = send(epmap->sockfd, (uint8_t *)buffer->data+buffer->offset, length, 0);
        if (n == SOCKET_ERROR) {
-           return EPMAP_ESOCKET;
+           return EPMAP_ESEND;
        }        
        length -= n;
        buffer->offset += n;  
@@ -653,7 +672,7 @@ static int epmap_recv(epmap_t *epmap)
 
    n = recv(epmap->sockfd, buffer->data, buffer->bufsize, 0);
    if (n == SOCKET_ERROR) {
-       return EPMAP_ESOCKET; 
+       return EPMAP_ERECV; 
    }
    buffer->length = n;
 
@@ -883,20 +902,29 @@ static size_t epmap_string_to_uuid(uuid_t *uuid, const char *string)
 
 static int uuid_is_nil(uuid_t *uuid)
 {
-   return (uuid->time_low == 0 && 
-           uuid->time_mid == 0 &&
+   return (uuid->time_low == 0 && uuid->time_mid == 0 &&
            uuid->time_hi_and_version == 0 && 
            uuid->clock_seq_hi_and_reserved == 0 && 
-           uuid->clock_seq_low == 0);    
+           uuid->clock_seq_low == 0 &&
+           uuid->node[0] == 0 && uuid->node[1] == 0 && 
+           uuid->node[2] == 0 && uuid->node[3] == 0 &&
+           uuid->node[4] == 0 && uuid->node[5] == 0);    
 }
 
 
 static int uuid_compare(uuid_t *uuid1, uuid_t *uuid2)
 {
    return !(uuid1->time_low == uuid2->time_low && 
-           uuid1->time_mid == uuid2->time_mid &&
-           uuid1->time_hi_and_version == uuid2->time_hi_and_version);
-
+            uuid1->time_mid == uuid2->time_mid &&
+            uuid1->time_hi_and_version == uuid2->time_hi_and_version &&
+            uuid1->clock_seq_hi_and_reserved == uuid2->clock_seq_hi_and_reserved &&
+            uuid1->clock_seq_low == uuid2->clock_seq_low &&
+            uuid1->node[0] == uuid2->node[0] && 
+            uuid1->node[1] == uuid2->node[1] &&
+            uuid1->node[2] == uuid2->node[2] &&
+            uuid1->node[3] == uuid2->node[3] &&
+            uuid1->node[4] == uuid2->node[4] &&
+            uuid1->node[5] == uuid2->node[5]);
 }
 
 /* Encode the BIND PDU to be sent to the endpoint portmapper. */
@@ -1022,6 +1050,7 @@ static int epmap_decode_bind_ack(epmap_t *epmap)
    ack.p_result_list.p_results = malloc(sizeof(p_result_t) * ack.p_result_list.n_results);
    if (ack.p_result_list.p_results == NULL) {  
        printf("Memory allocation failed");
+       return EPMAP_ENOMEM; /* $fixme */
    }
 
    for (i = 0; i < ack.p_result_list.n_results; i++) {
@@ -1068,7 +1097,8 @@ static int epmap_decode_bind_nak(epmap_t *epmap)
    nak.auth_length = ndr_rle16(epmap);
    nak.call_id = ndr_rle32(epmap);
 
-   epmap->status = nak.provider_reject_reason = ndr_rle16(epmap);
+   /* Should it be reason? */
+   epmap->reason = nak.provider_reject_reason = ndr_rle16(epmap);
    
    /* Array of protocol versions supported, ignored. */
    nak.versions = NULL; 
@@ -1112,10 +1142,14 @@ EPMAPAPI int epmap_bind(epmap_t **epmap, const char *server, uint16_t port)
    /* Connect to server. */
    result = epmap_connect(*epmap, (*epmap)->server, (*epmap)->port);   
    if (result != EPMAP_EOK) {
-       result |= WSAAPI_ERROR; /* Winsock error? */
+       /* Contains winsock error. */
+       /////result |= (WSAGetLastError() << 12); /* Winsock error. */
+
        epmap_destroy(*epmap);  
        return result;
    }
+
+  
    
    /* Populate the bind request. */
    bind.rpc_vers = 5;
@@ -1215,14 +1249,14 @@ EPMAPAPI int epmap_bind(epmap_t **epmap, const char *server, uint16_t port)
    /* Send the bind request. */   
    result = epmap_send(*epmap);
    if (result != EPMAP_EOK) {
-       result |= WSAAPI_ERROR; 
+       result |= (WSAGetLastError() << 12); 
        epmap_destroy(*epmap); 
        return result;
    }
 
    result = epmap_recv(*epmap);
-   if (result == SOCKET_ERROR) {
-       result |= WSAAPI_ERROR; 
+   if (result != EPMAP_EOK) {
+       result != (WSAGetLastError() << 12);
        epmap_destroy(*epmap);
        return result;
    }
@@ -1239,12 +1273,12 @@ EPMAPAPI int epmap_bind(epmap_t **epmap, const char *server, uint16_t port)
            break; 
        case RPC_PTYPE_BIND_NAK:
            result = epmap_decode_bind_nak(*epmap); 
-           /* Free up regardless the return value. */
+           /* Return the reason. */
+           result = ((((*epmap)->reason) << 12) & 0xfff) | EPMAP_ENAK; 
            epmap_destroy(*epmap);
-           result = EPMAP_ENAK;
            break;   
        default:
-           /* Not a valid RPC PDU, wrong protocol? */
+           /* Not a valid RPC PDU, wrong protocol? */ 
            result = EPMAP_EPROTO;
            epmap_destroy(*epmap);
            break; 
@@ -1294,7 +1328,9 @@ static int epmap_encode_request(epmap_t *epmap, const rpcconn_request_hdr_t *req
    ndr_wle32(epmap, 0); /* Version Option, or Attributes. */
 
     /* UUID Handle */
+
    ndr_wle32(epmap, epmap->handle.attributes); /* Something preceding the UUID. */
+   
    ndr_encode_uuid(epmap, &epmap->handle.uuid);
   
    /* Max entries */
@@ -1335,9 +1371,9 @@ typedef struct tower_entry {
 #define PROTO_ID_IP             0x09 /* DOD IP */
 #define PROTO_ID_RPC_CL         0x0a /* RPC Connectionless Protcol */
 #define PROTO_ID_RPC_CO         0x0b /* RPC Connection-Oriented Protocol */    
-#define PROTO_ID_SPX            0x0c /* SPX ??? */
+#define PROTO_ID_SPX            0x0c /* Netware SPX ??? */
 #define PROTO_ID_UUID           0x0d /* UUID */
-#define PROTO_ID_IPX            0x0e /* IPX ???  */
+#define PROTO_ID_IPX            0x0e /* Netware IPX ???  */
 #define PROTO_ID_NAMED_PIPES    0x0f /* Microsoft Named Pipes */
 #define PROTO_ID_NAMED_PIPES_2  0x10 /* Microsoft Named Pipes (SMB?) */   
 #define PROTO_ID_NETBIOS        0x11 /* Microsoft NetBIOS */
@@ -1423,6 +1459,10 @@ static int epmap_decode_response(epmap_t *epmap, tower_entry_t *tower, uuid_t *u
       
    /* Extract the interface UUID and use it for next requests. */
 
+   /* On the first call, the client must set the entry_handle to NULL. 
+    * On subsequent calls, the client will use the context handle returned.   
+    */
+    
    if (uuid_is_nil(&epmap->handle.uuid))
        ndr_decode_uuid(epmap, &epmap->handle.uuid);
    else /* We already have an handle. */
@@ -1443,7 +1483,7 @@ static int epmap_decode_response(epmap_t *epmap, tower_entry_t *tower, uuid_t *u
        ndr_decode_uuid(epmap, &object_uuid);
 
        ////if (uuid_compare(&epmap->handle.uuid, &object_uuid) != 0)
-       /////////printf("Error \n");
+       /////    printf("Error \n");
 
 
 
@@ -1590,10 +1630,20 @@ static int epmap_decode_response(epmap_t *epmap, tower_entry_t *tower, uuid_t *u
    while ((buffer->offset % 4) != 0) 
            buffer->offset++;
     
-   /* Return code can be either 0 or 0x4372489723 */
-   int code = ndr_rle32(epmap);
+   /* The status code could be either zero or 0x16c9a0cd. 
+    * 0x00000000: The method call returned at least one element that matched
+    * the search criteria. 
+    * 0x16c9a0d6: The are no elements that satisfy the specified search criteria.
+    * This is normally returned when there are no more entries.  
+    */
+  
+   /* $fixme */
 
-   return code;
+   uint32_t status;
+
+   epmap->status = status = ndr_rle32(epmap);
+
+   return status; /* $fixme return EPMAP_EOK */
 }
 
 static int epmap_decode_fault(epmap_t *epmap)
@@ -1620,6 +1670,7 @@ static int epmap_decode_fault(epmap_t *epmap)
    fault.cancel_count = ndr_rle8(epmap);
    fault.reserved = ndr_rle8(epmap);
 
+   /* Status can be */
    fault.status = ndr_rle32(epmap);
    /* 4 bytes of padding here? */
 
@@ -1666,6 +1717,7 @@ static int epmap_encode_shutdown(epmap_t *epmap, rpcconn_shutdown_hdr_t *shutdow
 static int epmap_shutdown(epmap_t *epmap)
 {
    rpcconn_shutdown_hdr_t shutdown;
+   int result;
 
    shutdown.rpc_vers = 5;
    shutdown.rpc_vers_minor = 0;
@@ -1685,8 +1737,15 @@ static int epmap_shutdown(epmap_t *epmap)
 
    epmap_encode_shutdown(epmap, &shutdown);  
    
-   /* Send shutdown PDU. $fixme */
-
+   /* Send shutdown PDU. $fixme 
+   result = epmap_send(epmap); 
+   if (result != EPMAP_EOK) {
+       result |= (WSAGetLastError() << 12);
+       return result;
+   } 
+ 
+   */
+   
    closesocket(epmap->sockfd);
    epmap->sockfd = INVALID_SOCKET;
    WSACleanup();   
@@ -1757,19 +1816,20 @@ static int epmap_request(epmap_t *epmap, tower_entry_t *tower, uuid_t *uuid, cha
  
    int n = epmap_encode_request(epmap, &request, &ept_lookup);
    if (n == 0) {
-     //////  printf("Error encoding \n");
+     //////  $fixme
    }
+
 
    result = epmap_send(epmap);
    if (result != EPMAP_EOK) {
-       result |= WSAAPI_ERROR;  
-       return EPMAP_EDEBUG;     
+       result |= (WSAGetLastError() << 12);  
+       return result;     
    } 
 
    result = epmap_recv(epmap);
    if (result != EPMAP_EOK) {
-       result |= WSAAPI_ERROR;
-       return EPMAP_EDEBUG;
+       result |= (WSAGetLastError() << 12); 
+       return result;
    }
 
    buffer_seek(epmap, 1, 2, SEEK_SET);
@@ -1778,15 +1838,16 @@ static int epmap_request(epmap_t *epmap, tower_entry_t *tower, uuid_t *uuid, cha
    switch(ptype) {
        case RPC_PTYPE_RESPONSE:
            result = epmap_decode_response(epmap, tower, uuid, annot);
+           /* $fixme check epmap->status instead. */ 
+           /* if result == EPMAP_EOK and epmap->status == ) $fixme */
            if (result == 0x16c9a0d6) {
                epmap_shutdown(epmap); 
-               return EPMAP_ENOENT;
+               return EPMAP_ENODATA;
            }
            break; 
        case RPC_PTYPE_FAULT:
-           //////printf("RECEIVED FAULT? \n");
            result = epmap_decode_fault(epmap);
-           result = EPMAP_EFAULT;  
+           result = ((epmap->status) << 12) | EPMAP_EFAULT;  
            break;
        case RPC_PTYPE_CO_CANCEL: /* Not sure we can we receive this. */ 
            result = EPMAP_EPROTO;
@@ -1825,46 +1886,57 @@ struct epmap_error {
    const char *str;
 } list[] = { 
    { EPMAP_EOK,      "Operation completed successfully" },
-   { EPMAP_EINVAL,   "One or more parameters are invalid" }, 
-   { 0x202,          "Could not resolve endpoint mapper name" },
-   { EPMAP_EWSAINIT, "Could not initialize Windows Sockets" }, 
-   { EPMAP_ESOCKET,  "Failed to create socket" },
-   { EPMAP_ECONNECT, "Could not connect to the endpoint mapper" }, 
+   { EPMAP_ENOMEM,   "Insufficient memory to perform the requested operation" },
+   { EPMAP_EINVAL,   "An invalid argument was passed to a library function" }, 
+   { EPMAP_EBADPTR,  "The system attempted to perform an invalid memory access" }, 
+   { EPMAP_EWSAINIT, "The system could not initialize Windows Sockets" },
+   { EPMAP_EDNSFAIL, "Could not resolve host name" },
+   { EPMAP_ESOCKET,  "Could not connect to the endpoint mapper" },
+   { EPMAP_ESEND,    "An error has occurred while sending " },
+   { EPMAP_ERECV,    "An error has occurred while receiving " },
+
    { EPMAP_EACK,     "ACK received. " },
-   { EPMAP_ENAK,     "A bind-nak has been received " }, 
-   { 0x400,          "Error 0x400" },
-   { 0x401,          "Error 0x401" },
-   { 0x402,          "Failed to connect to endpoint mapper" },
-   { 0x403,          "???????" }, 
-   { 0x404,          "???????" },
-   { 0x405,          "???????" },
-   { 0x406,          "???????" },
-   { 0x407,          "Endpoint mapper rejected the bind requestFailed to bind (rejection)" },
-   { 0x408,          "Error 408" },
-   { 0x410,          "Error 410" },
+   { EPMAP_ENAK,     "The endpoint mapper did not acknowledge the bind request" }, 
+   { EPMAP_EFAULT,   "The endpoint mapped rejected the call request" },
+   { EPMAP_EPROTO,   "Protocol error" },
+   { 0x402,          "??????????????????????" },
+
+   { EPMAP_ENODATA,  "The endpoint mapped completed. " },
+   { 0x407,          "?????????????????????????????????????????????" },
+   { 0x408,          "?????????????????????????????????????" },
+
    { 0xffffffff,      NULL }, 
 };
 
 EPMAPAPI char *epmap_error(int result)
 {
-   static char buffer[256] = { "Unknown Error" };
-   char *ptr = buffer;
-   int i;
-   int n;
+   static char buffer[256] = { 0 };
+   int i, n;
+   int offset = 0;
+   int status = result & 0xfff;
 
    for (i = 0; list[i].str != NULL; i++) {
-       if (list[i].code == result)
+       if (list[i].code ==  status) { /* Mask extended errors, if any. */
            n = i; 
+       } 
    }
 
-   ptr = list[n].str;
+   offset = _snprintf(buffer, sizeof(buffer), "%s", list[n].str); 
 
-   return ptr;
+   if (status == EPMAP_ESOCKET) 
+       offset = _snprintf(buffer+offset, sizeof(buffer)-offset, " (errno: %u)", result>>12);
+   else if (status == EPMAP_ENAK) 
+       offset = _snprintf(buffer+offset, sizeof(buffer)-offset, " (reason: %u)", result>>12); 
+   else if (status == EPMAP_EFAULT) 
+       offset = 0;
+  
+   return &buffer[0];
 }
 
+/* $fixme */
 void display_usage(char *progname)
 {
-    printf("display_usage here. \n");
+    printf("display_usage here!\n");
 }
 
 
@@ -1880,7 +1952,7 @@ int main(int argc, char *argv[])
    int result = EPMAP_EOK;
    
    if (argc != 2 && argc != 4) {
-       fprintf(stderr, "-epmap: Wrong number of arguments.\n");
+       fprintf(stderr, "-epmap: Invalid number of arguments.\n");
        display_usage("test");
        return EXIT_FAILURE;
    }
@@ -1890,20 +1962,32 @@ int main(int argc, char *argv[])
        server = argv[1];
        port = DEFAULT_EPMAP_PORT;
    } else { /* argc == 4 */ 
+
+     if (argv[0][1] != 'p' && argv[0][1] !='P') {
+         display_usage("Test");
+         return EXIT_FAILURE;
+      
+     }
        server = argv[3];
        port = atoi(argv[2]);
+       /* Check port? */
+        
    } 
 
-   printf("\nBinding to portmapper: %s[%u] ...\n", server, port);
+   printf("\nBinding to endpoint portmapper: %s[%u] ...\n", server, port);
    result = epmap_bind(&epmap, server, port);
    if (result != EPMAP_EOK) {
-       fprintf(stderr, "-epmap: failed to bind to endpoint portmapper\n"); 
-       fprintf(stderr, "%s\n", epmap_error(result));   
+     //////  fprintf(stderr, "-epmap: failed to bind to endpoint portmapper\n"); 
+     /////////  fprintf(stderr, "-epmap: An error has occurred: ");
+
+       
+       fprintf(stderr, "-epmap: %s.\n", epmap_error(result));   
        return EXIT_FAILURE;
    }
 
    printf("Querying Endpoint Mapper Database...\n\n");
 
+   /* */
    do {
 
        memset(&tower, '\0', sizeof(tower_entry_t)); 
@@ -1936,11 +2020,11 @@ int main(int argc, char *argv[])
                    
        }
  
-   } while (result == EPMAP_EOK || result != EPMAP_ENOENT);
+   } while (result == EPMAP_EOK || result != EPMAP_ENODATA);
 
    epmap_destroy(epmap);
 
-   if (result != EPMAP_ENOENT) {
+   if (result != EPMAP_ENODATA) {
        fprintf(stderr, "-epmap: An error has occurred.\n");
        fprintf(stderr, " \n");
        return EXIT_FAILURE;
